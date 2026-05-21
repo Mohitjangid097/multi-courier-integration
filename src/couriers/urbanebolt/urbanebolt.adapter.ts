@@ -9,9 +9,17 @@ import {
   TrackingEvent,
 } from '../courier.interface';
 import { CreateOrderDto } from '../../dto/create-order.dto';
-import { CourierPartner, ShipmentStatus, PaymentMode } from '../../libs/constants';
+import { CourierPartner, ShipmentStatus, PaymentMode, ServiceType } from '../../libs/constants';
 import { withRetry } from '../../common/utils/retry.util';
 
+/**
+ * UrbaneBolt UAT adapter
+ *
+ * Auth:   POST /api/v1/auth/getToken/
+ * Create: POST /api/v1/services/manifest/      (array payload)
+ * Track:  GET  /api/v1/services/tracking-pub/?awb=<awb>
+ * Cancel: POST /api/v1/services/cancel/        { awbs: "<awb>" }
+ */
 @Injectable()
 export class UrbaneBoltAdapter implements ICourierAdapter {
   readonly courierPartner = CourierPartner.URBANEBOLT;
@@ -23,11 +31,13 @@ export class UrbaneBoltAdapter implements ICourierAdapter {
 
   constructor(private readonly config: ConfigService) {
     this.http = axios.create({
-      baseURL: this.config.get<string>('URBANEBOLT_BASE_URL'),
+      baseURL: this.config.get<string>('URBANEBOLT_BASE_URL', 'https://uat.urbanebolt.in'),
       timeout: this.config.get<number>('HTTP_TIMEOUT', 10000),
       headers: { 'Content-Type': 'application/json' },
     });
   }
+
+  // ── Authentication ────────────────────────────────────────────────────────
 
   private async authenticate(): Promise<string> {
     if (this.authToken && this.tokenExpiresAt && new Date() < this.tokenExpiresAt) {
@@ -35,42 +45,54 @@ export class UrbaneBoltAdapter implements ICourierAdapter {
     }
 
     this.logger.log('Authenticating with UrbaneBolt...');
-    const response = await this.http.post('/api/authenticate', {
+
+    const response = await this.http.post('/api/v1/auth/getToken/', {
       username: this.config.get<string>('URBANEBOLT_USERNAME'),
       password: this.config.get<string>('URBANEBOLT_PASSWORD'),
     });
 
-    this.authToken = response.data?.token || response.data?.data?.token;
-    // Expire 5 minutes before actual expiry to avoid edge cases
+    // Token is returned at response.data.token or response.data.data.token
+    const token = response.data?.token ?? response.data?.data?.token;
+    if (!token) {
+      throw new Error('UrbaneBolt auth response did not contain a token');
+    }
+
+    this.authToken = token;
+    // Cache for 55 minutes (tokens typically valid 1 hour)
     this.tokenExpiresAt = new Date(Date.now() + 55 * 60 * 1000);
 
     this.logger.log('UrbaneBolt authentication successful');
-    return this.authToken!;
+    return token;
   }
 
-  private async getAuthHeader(): Promise<Record<string, string>> {
+  private async getHeaders(): Promise<Record<string, string>> {
     const token = await this.authenticate();
-    return { Authorization: `Bearer ${token}` };
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
   }
 
-  private async executeWithAuth<T>(
-    fn: (headers: Record<string, string>) => Promise<T>,
-  ): Promise<T> {
+  /**
+   * Executes an API call with:
+   *  1. Automatic token injection
+   *  2. One re-auth retry on 401
+   *  3. Exponential backoff on 5xx / network errors
+   */
+  private async execute<T>(fn: (headers: Record<string, string>) => Promise<T>): Promise<T> {
     const maxAttempts = this.config.get<number>('RETRY_MAX_ATTEMPTS', 3);
     const initialDelay = this.config.get<number>('RETRY_INITIAL_DELAY_MS', 1000);
 
     return withRetry(
       async () => {
         try {
-          const headers = await this.getAuthHeader();
-          return await fn(headers);
+          return await fn(await this.getHeaders());
         } catch (error: any) {
+          // Force re-auth on expired token, then retry once
           if (error?.response?.status === 401) {
-            // Force re-authentication on token expiry
             this.authToken = null;
             this.tokenExpiresAt = null;
-            const headers = await this.getAuthHeader();
-            return await fn(headers);
+            return await fn(await this.getHeaders());
           }
           throw error;
         }
@@ -80,53 +102,86 @@ export class UrbaneBoltAdapter implements ICourierAdapter {
     );
   }
 
+  // ── Create Order ──────────────────────────────────────────────────────────
+
   async createOrder(dto: CreateOrderDto): Promise<CourierOrderResult> {
-    const payload = this.mapToUrbaneBoltPayload(dto);
+    const payload = this.buildManifestPayload(dto);
+    this.logger.log(`Creating UrbaneBolt shipment for order_id: ${dto.order_id}`);
 
-    this.logger.log(`Creating UrbaneBolt order for order_id: ${dto.order_id}`);
-
-    const response = await this.executeWithAuth(async (headers) => {
-      const res = await this.http.post('/api/orders', payload, { headers });
+    const response = await this.execute(async (headers) => {
+      // Manifest API expects an array
+      const res = await this.http.post('/api/v1/services/manifest/', [payload], { headers });
       return res.data;
     });
 
+    /*
+     * Manifest response is an array of results, one per shipment.
+     * Each item typically: { awb: "200000001170", orderNumber: "...", status: "...", ... }
+     */
+    const result = Array.isArray(response) ? response[0] : response;
+    const awb = String(result?.awb ?? result?.awbNumber ?? result?.data?.awb ?? '');
+
     return {
-      courier_order_id: String(response?.data?.order_id || response?.order_id || ''),
-      awb_number: String(response?.data?.awb_number || response?.awb_number || ''),
+      courier_order_id: awb,   // AWB is the primary identifier for all subsequent calls
+      awb_number: awb,
       status: ShipmentStatus.CREATED,
       raw_response: response,
     };
   }
 
-  async trackOrder(courierOrderId: string, awbNumber?: string): Promise<CourierTrackResult> {
-    this.logger.log(`Tracking UrbaneBolt order: ${courierOrderId}`);
+  // ── Track Order ───────────────────────────────────────────────────────────
 
-    const response = await this.executeWithAuth(async (headers) => {
-      const identifier = awbNumber || courierOrderId;
-      const res = await this.http.get(`/api/orders/${identifier}/track`, { headers });
+  async trackOrder(courierOrderId: string, awbNumber?: string): Promise<CourierTrackResult> {
+    const awb = awbNumber || courierOrderId;
+    this.logger.log(`Tracking UrbaneBolt shipment AWB: ${awb}`);
+
+    const response = await this.execute(async (headers) => {
+      const res = await this.http.get('/api/v1/services/tracking-pub/', {
+        headers,
+        params: { awb },
+      });
       return res.data;
     });
 
-    const events = this.mapTrackingEvents(response);
-    const latestStatus = this.mapStatus(
-      events[0]?.status || response?.data?.current_status || 'CREATED',
-    );
+    /*
+     * Tracking response shape (approximate):
+     * {
+     *   awb: "200000001170",
+     *   currentStatus: "IN_TRANSIT",
+     *   shipmentHistory: [
+     *     { status: "...", statusDateTime: "...", location: "...", remarks: "..." }
+     *   ]
+     * }
+     */
+    const history: any[] = response?.shipmentHistory ?? response?.data?.shipmentHistory ?? [];
+    const currentStatus = response?.currentStatus ?? response?.data?.currentStatus ?? '';
+
+    const events: TrackingEvent[] = history.map((e: any) => ({
+      status: e.status ?? e.eventType ?? '',
+      timestamp: new Date(e.statusDateTime ?? e.eventTime ?? Date.now()),
+      location: e.location ?? e.city ?? undefined,
+      description: e.remarks ?? e.description ?? undefined,
+    }));
 
     return {
-      status: latestStatus,
-      awb_number: awbNumber,
+      status: this.mapStatus(currentStatus),
+      awb_number: awb,
       tracking_events: events,
       raw_response: response,
     };
   }
 
-  async cancelOrder(courierOrderId: string): Promise<CourierCancelResult> {
-    this.logger.log(`Cancelling UrbaneBolt order: ${courierOrderId}`);
+  // ── Cancel Order ──────────────────────────────────────────────────────────
 
-    const response = await this.executeWithAuth(async (headers) => {
+  async cancelOrder(courierOrderId: string): Promise<CourierCancelResult> {
+    // UrbaneBolt cancel uses AWB number
+    const awb = courierOrderId;
+    this.logger.log(`Cancelling UrbaneBolt shipment AWB: ${awb}`);
+
+    const response = await this.execute(async (headers) => {
       const res = await this.http.post(
-        `/api/orders/${courierOrderId}/cancel`,
-        {},
+        '/api/v1/services/cancel/',
+        { awbs: awb },
         { headers },
       );
       return res.data;
@@ -138,59 +193,92 @@ export class UrbaneBoltAdapter implements ICourierAdapter {
     };
   }
 
-  private mapToUrbaneBoltPayload(dto: CreateOrderDto): object {
+  // ── Payload Mapping ───────────────────────────────────────────────────────
+
+  private buildManifestPayload(dto: CreateOrderDto): object {
+    const customerCode = this.config.get<string>('URBANEBOLT_CUSTOMER_CODE', '');
+    const invoiceDate =
+      dto.invoice_date ?? new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
     return {
-      order_number: dto.order_id,
-      pickup: {
-        name: dto.sender_name,
-        contact: dto.sender_phone,
-        address: dto.sender_address,
-        city: dto.sender_city,
-        pincode: dto.sender_pincode,
-      },
-      delivery: {
-        name: dto.receiver_name,
-        contact: dto.receiver_phone,
-        address: dto.receiver_address,
-        city: dto.receiver_city,
-        pincode: dto.receiver_pincode,
-      },
-      package: {
-        weight: dto.weight,
-        description: dto.item_description || 'General Goods',
-        value: dto.item_value || 0,
-      },
-      payment: {
-        mode: dto.payment_mode === PaymentMode.COD ? 'cod' : 'prepaid',
-        cod_amount: dto.cod_amount || 0,
-      },
+      customerCode,
+      orderNumber: dto.order_id,
+
+      // Package details
+      weight: dto.weight,
+      pieces: dto.pieces ?? 1,
+      length: dto.length ?? 10,
+      breadth: dto.breadth ?? 10,
+      height: dto.height ?? 10,
+      itemDescription: dto.item_description ?? 'General Goods',
+      declaredValue: dto.item_value ?? 0,
+      itemQuantity: dto.item_quantity ?? 1,
+
+      // Service & payment
+      serviceType: dto.service_type ?? ServiceType.NDD,
+      payMode: dto.payment_mode === PaymentMode.COD ? 'COD' : 'PPD',
+      collectableValue: dto.cod_amount ?? 0,
+
+      // Invoice
+      invoiceNumber: dto.invoice_number ?? dto.order_id,
+      invoiceDate,
+      invoiceValue: dto.invoice_value ?? dto.item_value ?? 0,
+
+      // Shipper (sender)
+      shprName: dto.sender_name,
+      shprMobile: Number(dto.sender_phone),
+      shprEmail: dto.sender_email ?? '',
+      shprAddress: dto.sender_address,
+      shprAddressType: 'Seller',
+      shprCity: dto.sender_city,
+      shprState: dto.sender_state,
+      shprCountry: 'INDIA',
+      shprPincode: Number(dto.sender_pincode),
+
+      // Consignee (receiver)
+      consName: dto.receiver_name,
+      consMobile: Number(dto.receiver_phone),
+      consEmail: dto.receiver_email ?? '',
+      consAddress: dto.receiver_address,
+      consAddressType: 'Home',
+      consCity: dto.receiver_city,
+      consState: dto.receiver_state,
+      consCountry: 'INDIA',
+      consPincode: Number(dto.receiver_pincode),
+
+      // Return (defaults to sender)
+      rtnName: dto.sender_name,
+      rtnMobile: Number(dto.sender_phone),
+      rtnEmail: dto.sender_email ?? '',
+      rtnAddress: dto.sender_address,
+      rtnAddressType: 'Seller',
+      rtnCity: dto.sender_city,
+      rtnState: dto.sender_state,
+      rtnCountry: 'INDIA',
+      rtnPincode: Number(dto.sender_pincode),
     };
   }
 
-  private mapTrackingEvents(response: any): TrackingEvent[] {
-    const events: any[] = response?.data?.tracking_events || response?.tracking_events || [];
-    return events.map((e: any) => ({
-      status: e.status || e.event_type || '',
-      timestamp: new Date(e.timestamp || e.event_time || Date.now()),
-      location: e.location || e.city || undefined,
-      description: e.description || e.remarks || undefined,
-    }));
-  }
+  // ── Status Mapping ────────────────────────────────────────────────────────
 
   private mapStatus(courierStatus: string): ShipmentStatus {
-    const statusMap: Record<string, ShipmentStatus> = {
+    const map: Record<string, ShipmentStatus> = {
       created: ShipmentStatus.CREATED,
       booked: ShipmentStatus.CREATED,
+      manifested: ShipmentStatus.CREATED,
       picked: ShipmentStatus.PICKED_UP,
       picked_up: ShipmentStatus.PICKED_UP,
       in_transit: ShipmentStatus.IN_TRANSIT,
       intransit: ShipmentStatus.IN_TRANSIT,
       out_for_delivery: ShipmentStatus.OUT_FOR_DELIVERY,
+      ofd: ShipmentStatus.OUT_FOR_DELIVERY,
       delivered: ShipmentStatus.DELIVERED,
       cancelled: ShipmentStatus.CANCELLED,
       rto: ShipmentStatus.RTO,
+      rto_initiated: ShipmentStatus.RTO,
       failed: ShipmentStatus.FAILED,
+      undelivered: ShipmentStatus.FAILED,
     };
-    return statusMap[courierStatus?.toLowerCase()] || ShipmentStatus.IN_TRANSIT;
+    return map[courierStatus?.toLowerCase().replace(/\s+/g, '_')] ?? ShipmentStatus.IN_TRANSIT;
   }
 }

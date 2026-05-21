@@ -13,7 +13,7 @@ import { OrdersService } from './orders.service';
 import { CreateOrderDto } from '../dto/create-order.dto';
 import { BulkOrderDto } from '../dto/bulk-order.dto';
 
-@Controller('api/orders')
+@Controller('api/v1/orders')
 @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false, transform: true }))
 export class OrdersController {
   constructor(private readonly ordersService: OrdersService) {}

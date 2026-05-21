@@ -19,6 +19,11 @@ export enum PaymentMode {
   PREPAID = 'PREPAID',
 }
 
+export enum ServiceType {
+  SDD = 'SDD',
+  NDD = 'NDD',
+}
+
 export const SUPPORTED_COURIERS = Object.values(CourierPartner);
 
 export const RETRY_CONFIG = {
